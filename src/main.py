@@ -2,10 +2,11 @@
 
 import asyncio
 import logging
+import os
 import signal
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 from src.discord_bot import DiscordFileWatcherBot
 from src.file_watcher import FileWatcher, create_from_env
@@ -18,7 +19,7 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler('/data/watcher.log', encoding='utf-8')
+        logging.FileHandler(os.getenv('LOG_FILE', '/watcher.log'), encoding='utf-8')
     ]
 )
 
@@ -98,7 +99,7 @@ class FileWatcherService:
 
     async def check_cycle(self):
         """Execute one check cycle."""
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         logger.info("Starting check cycle...")
 
         # Check if in quiet hours
@@ -220,7 +221,7 @@ class FileWatcherService:
 
                 if not is_stable:
                     # Add to pending
-                    self.state_manager.add_pending_file(path, size, datetime.utcnow())
+                    self.state_manager.add_pending_file(path, size, datetime.now(timezone.utc))
                     pending_count += 1
                     logger.debug(f"Added file {path} to pending (still growing)")
 

@@ -2,7 +2,7 @@
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -112,7 +112,7 @@ class StateManager:
             modified_time: File modification time
             status: File status ('stable', 'pending', etc.)
         """
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         existing_state = self.state['files'].get(file_path)
 
@@ -263,7 +263,7 @@ class StateManager:
             in_quiet_hours: Whether currently in quiet hours
         """
         self.state['in_quiet_hours'] = in_quiet_hours
-        self.state['last_quiet_hours_check'] = datetime.utcnow().isoformat()
+        self.state['last_quiet_hours_check'] = datetime.now(timezone.utc).isoformat()
 
     def was_in_quiet_hours(self) -> bool:
         """

@@ -1,5 +1,6 @@
 """File watching logic for scanning and detecting changes."""
 
+import fnmatch
 import logging
 import os
 from datetime import datetime
@@ -25,6 +26,7 @@ class FileWatcher:
         quiet_hours_end: int = 8,
         timezone: str = 'UTC',
         min_file_size: int = 0,
+        exclude_patterns: Optional[List[str]] = None,
     ):
         """
         Initialize file watcher.
@@ -45,6 +47,7 @@ class FileWatcher:
         self.quiet_hours_end = quiet_hours_end
         self.timezone = pytz.timezone(timezone)
         self.min_file_size = min_file_size
+        self.exclude_patterns = exclude_patterns or []
 
     def scan_folder(self) -> Dict[str, Dict[str, any]]:
         """
@@ -69,6 +72,10 @@ class FileWatcher:
                 if file_path.is_symlink():
                     continue
 
+                # Skip excluded patterns
+                if self._is_excluded(file_path):
+                    continue
+
                 try:
                     metadata = self._get_file_metadata(file_path)
                     relative_path = metadata['relative_path']
@@ -84,6 +91,35 @@ class FileWatcher:
         except Exception as e:
             logger.error(f"Failed to scan folder: {e}")
             return {}
+
+    def _is_excluded(self, file_path: Path) -> bool:
+        """
+        Check if a file matches any exclusion pattern.
+
+        Patterns are matched against both the full relative path and each
+        individual path component, so ~private-asp* excludes the folder
+        and everything inside it.
+
+        Args:
+            file_path: Absolute path to file
+
+        Returns:
+            True if the file should be excluded
+        """
+        if not self.exclude_patterns:
+            return False
+
+        relative = file_path.relative_to(self.watch_folder)
+        parts = relative.parts
+        relative_str = str(relative).replace('\\', '/')
+
+        for pattern in self.exclude_patterns:
+            if fnmatch.fnmatch(relative_str, pattern):
+                return True
+            if any(fnmatch.fnmatch(part, pattern) for part in parts):
+                return True
+
+        return False
 
     def _get_file_metadata(self, file_path: Path) -> Dict[str, any]:
         """
@@ -253,6 +289,8 @@ def create_from_env() -> FileWatcher:
     quiet_hours_end = get_env_int('QUIET_HOURS_END', 8)
     timezone = os.getenv('TIMEZONE', 'UTC')
     min_file_size = get_env_int('MIN_FILE_SIZE', 0)
+    exclude_patterns_raw = os.getenv('EXCLUDE_PATTERNS', '')
+    exclude_patterns = [p.strip() for p in exclude_patterns_raw.split(',') if p.strip()]
 
     return FileWatcher(
         watch_folder=watch_folder,
@@ -262,4 +300,5 @@ def create_from_env() -> FileWatcher:
         quiet_hours_end=quiet_hours_end,
         timezone=timezone,
         min_file_size=min_file_size,
+        exclude_patterns=exclude_patterns,
     )

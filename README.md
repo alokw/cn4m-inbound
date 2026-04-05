@@ -36,8 +36,9 @@ Edit `.env` with your settings:
 
 ```env
 # Required
-WATCH_FOLDER=/watch
-STATE_FILE=/data/state.json
+WATCH_FOLDER=/path/to/folder/to/watch
+STATE_FILE=/path/to/state.json
+LOG_FILE=/path/to/watcher.log
 DISCORD_BOT_TOKEN=your_bot_token_here
 DISCORD_CHANNEL_ID=your_channel_id_here
 CHECK_INTERVAL=5m
@@ -51,12 +52,20 @@ TIMEZONE=UTC
 MIN_FILE_SIZE=0
 ```
 
+`WATCH_FOLDER`, `STATE_FILE`, and `LOG_FILE` are **host paths** that get bind-mounted into the container. The state and log files must exist on the host before starting — Docker will create a directory instead of a file if they don't:
+
+```bash
+# Linux/macOS
+touch /path/to/state.json /path/to/watcher.log
+
+# Windows (PowerShell)
+New-Item -ItemType File -Force "/path/to/state.json"
+New-Item -ItemType File -Force "/path/to/watcher.log"
+```
+
 ### 3. Start the Service
 
 ```bash
-# Create directories for your files and state
-mkdir -p watch data
-
 # Start with Docker Compose
 docker-compose up -d
 
@@ -70,8 +79,9 @@ docker-compose logs -f
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `WATCH_FOLDER` | Path inside container to watch | `/watch` |
-| `STATE_FILE` | Path inside container for state JSON | `/data/state.json` |
+| `WATCH_FOLDER` | Host path to the folder to watch | `/mnt/files/incoming` |
+| `STATE_FILE` | Host path for the state JSON file | `/mnt/data/state.json` |
+| `LOG_FILE` | Host path for the watcher log file | `/mnt/data/watcher.log` |
 | `DISCORD_BOT_TOKEN` | Your Discord bot token | `MTIzNDU2Nzg5...` |
 | `DISCORD_CHANNEL_ID` | Discord channel ID for notifications | `123456789012345678` |
 | `CHECK_INTERVAL` | How often to check (with suffix) | `5m`, `30s`, `1h` |
@@ -86,6 +96,34 @@ docker-compose logs -f
 | `QUIET_HOURS_END` | Hour when quiet hours end (0-23) | `8` |
 | `TIMEZONE` | Timezone for quiet hours | `UTC` |
 | `MIN_FILE_SIZE` | Only check files >= this size for growth (bytes) | `0` |
+| `EXCLUDE_PATTERNS` | Comma-separated glob patterns to ignore (matched against full relative path and each folder/file name component) | `~private*,*.tmp` |
+
+### Exclude Patterns
+
+Patterns are matched against both the full relative path and each individual folder/file name component. This means folder-based patterns like `System Volume Information` will automatically exclude everything inside that folder without needing a trailing `*`.
+
+Spaces within pattern names are fine — values are split on commas only, not spaces. No quoting is needed.
+
+Supported glob characters:
+
+| Character | Meaning |
+|-----------|---------|
+| `*` | Matches anything (including nothing) |
+| `?` | Matches any single character |
+| `[seq]` | Matches any character in `seq` |
+
+**Matching literal brackets:** Square brackets are special in glob syntax. To match a filename that literally contains `[` or `]` (e.g. `[Auto Save]`), escape them as `[[]` and `[]]`:
+
+```env
+# Matches files containing [Auto Save] in the name
+EXCLUDE_PATTERNS=*[[]Auto Save[]]*
+```
+
+A typical set of patterns for Windows watch folders:
+
+```env
+EXCLUDE_PATTERNS=System Volume Information,$Recycle.Bin,RECYCLE?,Recovery,thumbs.db,*.DS_*,*[[]Auto Save[]]*,*.tmp
+```
 
 ### Check Interval Format
 
@@ -155,12 +193,20 @@ The service preserves full folder paths in notifications:
 
 ## Docker Volume Mapping
 
-Map your local folders to container paths:
+`WATCH_FOLDER`, `STATE_FILE`, and `LOG_FILE` in `.env` are host paths that get bind-mounted into the container automatically. There is no need to edit `docker-compose.yml` for different instances — just point each `.env` to different host paths.
 
-```yaml
-volumes:
-  - ./watch:/watch          # Your files to watch
-  - ./data:/data            # State file and logs
+Running multiple watches against a shared data folder is straightforward:
+
+```env
+# Instance 1 .env
+WATCH_FOLDER=/mnt/incoming/show_a
+STATE_FILE=/mnt/data/show_a_state.json
+LOG_FILE=/mnt/data/show_a.log
+
+# Instance 2 .env
+WATCH_FOLDER=/mnt/incoming/show_b
+STATE_FILE=/mnt/data/show_b_state.json
+LOG_FILE=/mnt/data/show_b.log
 ```
 
 ## Monitoring
@@ -171,13 +217,48 @@ View service logs:
 docker-compose logs -f file-watcher
 ```
 
-Check state file:
+Check state file and logs directly at the host paths defined in your `.env`:
 
 ```bash
-cat data/state.json
+cat /path/to/state.json
+tail -f /path/to/watcher.log
 ```
 
 ## Troubleshooting
+
+### Build warning: git was not found in the system
+
+During `docker-compose up --build` you may see:
+
+```
+level=warning msg="current commit information was not captured by the build"
+```
+
+This is Docker BuildKit trying to embed the current git commit SHA into the image metadata. It's harmless and has no effect on the container. To suppress it, set the following environment variable before building:
+
+```bash
+# Linux/macOS
+export BUILDX_NO_DEFAULT_PROVENANCE=1
+
+# Windows (PowerShell)
+$env:BUILDX_NO_DEFAULT_PROVENANCE=1
+```
+
+### Resetting state to redetect all files
+
+The state is loaded into memory at startup and written back to disk after each cycle. Clearing the state file while the container is running has no effect — it will be overwritten on the next cycle.
+
+To force all files to be treated as new:
+
+```bash
+# Windows (PowerShell)
+Clear-Content "M:\inbound_data\your_state.json"
+docker-compose restart
+
+# Linux/macOS
+echo '' > /path/to/state.json
+docker-compose restart
+```
 
 ### Bot not sending messages
 
@@ -223,6 +304,7 @@ pip install -r requirements.txt
 # Set environment variables
 export WATCH_FOLDER=./watch
 export STATE_FILE=./data/state.json
+export LOG_FILE=./data/watcher.log
 export DISCORD_BOT_TOKEN=your_token
 export DISCORD_CHANNEL_ID=your_channel_id
 export CHECK_INTERVAL=30s

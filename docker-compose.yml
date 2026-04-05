@@ -1,15 +1,15 @@
-version: '3.8'
-
 services:
   file-watcher:
     build: .
-    container_name: discord-file-watcher
+    container_name: inbound
     restart: unless-stopped
     volumes:
       - ${WATCH_FOLDER:-./watch}:/watch
-      - ${STATE_FILE_PATH:-./data}:/data
+      - ${STATE_FILE:-./data/state.json}:/state.json
+      - ${LOG_FILE:-./data/watcher.log}:/watcher.log
     env_file:
       - .env
     environment:
-      - WATCH_FOLDER=${WATCH_FOLDER:-/watch}
-      - STATE_FILE=${STATE_FILE:-/data/state.json}
+      - WATCH_FOLDER=/watch
+      - STATE_FILE=/state.json
+      - LOG_FILE=/watcher.log

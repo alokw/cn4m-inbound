@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import discord
@@ -63,6 +63,39 @@ class DiscordFileWatcherBot(commands.Bot):
             logger.error(f"Failed to send notification: {e}")
             return False
 
+    async def _send_chunked(self, parts: List[str]) -> bool:
+        """
+        Send a list of lines as one or more messages, each within Discord's 2000 char limit.
+
+        Args:
+            parts: Lines to send in order
+
+        Returns:
+            True if all messages sent successfully
+        """
+        chunks = []
+        current: List[str] = []
+        current_len = 0
+
+        for part in parts:
+            addition = len(part) + (1 if current else 0)  # +1 for newline
+            if current and current_len + addition > 2000:
+                chunks.append("\n".join(current))
+                current = [part]
+                current_len = len(part)
+            else:
+                current.append(part)
+                current_len += addition
+
+        if current:
+            chunks.append("\n".join(current))
+
+        success = True
+        for chunk in chunks:
+            if not await self.send_notification(chunk):
+                success = False
+        return success
+
     async def send_new_files_notification(
         self,
         files: List[Dict[str, any]],
@@ -81,31 +114,18 @@ class DiscordFileWatcherBot(commands.Bot):
         if not files:
             return True
 
-        # Group files by modified time to show common timestamp
-        # Use the most recent modified time as reference
-        most_recent = max(
-            datetime.fromisoformat(f['modified_time'])
-            for f in files
-        )
-        processed_time = datetime.utcnow()
-
+        count = len(files)
+        label = "file" if count == 1 else "files"
         message_parts = [
-            "📁 **New file(s) discovered:**",
-            ""
+            f"📁 **{count} new {label} discovered:**"
         ]
 
-        for file_data in files:
-            path = file_data['path']
+        for file_data in sorted(files, key=lambda f: f['relative_path']):
+            path = file_data['relative_path']
             size = format_size(file_data['size'])
-            mime_type = file_data['mime_type']
-            message_parts.append(f"• `{path}` ({size}, {mime_type})")
+            message_parts.append(f"• `{path}` ({size})")
 
-        message_parts.append("")
-        message_parts.append(f"Modified: {format_timestamp(most_recent)}")
-        message_parts.append(f"Processed: {format_timestamp(processed_time)}")
-
-        message = "\n".join(message_parts)
-        return await self.send_notification(message)
+        return await self._send_chunked(message_parts)
 
     async def send_deleted_files_notification(
         self,
@@ -123,22 +143,18 @@ class DiscordFileWatcherBot(commands.Bot):
         if not files:
             return True
 
+        count = len(files)
+        label = "file" if count == 1 else "files"
         message_parts = [
-            "🗑️ **File(s) deleted or moved:**",
-            ""
+            f"🗑️ **{count} {label} deleted or moved:**"
         ]
 
-        for file_data in files:
+        for file_data in sorted(files, key=lambda f: f['path']):
             path = file_data['path']
             size = format_size(file_data['size'])
-            mime_type = file_data.get('mime_type', 'unknown')
-            last_seen = format_timestamp(datetime.fromisoformat(file_data['last_seen']))
+            message_parts.append(f"• `{path}` ({size})")
 
-            message_parts.append(f"• `{path}` ({size}, {mime_type})")
-            message_parts.append(f"  Last seen: {last_seen}")
-
-        message = "\n".join(message_parts)
-        return await self.send_notification(message)
+        return await self._send_chunked(message_parts)
 
     async def send_summary_notification(
         self,
@@ -163,7 +179,7 @@ class DiscordFileWatcherBot(commands.Bot):
         if new_files:
             message_parts.append(f"Discovered {len(new_files)} new file(s):")
             for file_data in new_files:
-                path = file_data['path']
+                path = file_data['relative_path']
                 size = format_size(file_data['size'])
                 mime_type = file_data['mime_type']
                 message_parts.append(f"• `{path}` ({size}, {mime_type})")
@@ -175,8 +191,7 @@ class DiscordFileWatcherBot(commands.Bot):
                 path = file_data['path']
                 message_parts.append(f"• `{path}`")
 
-        message = "\n".join(message_parts)
-        return await self.send_notification(message)
+        return await self._send_chunked(message_parts)
 
     async def send_error_notification(self, error_message: str) -> bool:
         """
