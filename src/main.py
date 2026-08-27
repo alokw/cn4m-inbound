@@ -8,7 +8,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
-from src.discord_bot import DiscordFileWatcherBot
+from src.discord_webhook import DiscordWebhookNotifier
 from src.file_watcher import FileWatcher, create_from_env
 from src.state_manager import StateManager
 from src.utils import get_env_int, get_env_var, parse_interval
@@ -32,7 +32,7 @@ class FileWatcherService:
     def __init__(self):
         """Initialize the service."""
         self.running = True
-        self.bot = None
+        self.notifier = None
         self.state_manager = None
         self.file_watcher = None
         self.check_interval = None
@@ -43,8 +43,7 @@ class FileWatcherService:
             # Load required environment variables
             watch_folder = get_env_var('WATCH_FOLDER', required=True)
             state_file = get_env_var('STATE_FILE', required=True)
-            discord_token = get_env_var('DISCORD_BOT_TOKEN', required=True)
-            channel_id = get_env_var('DISCORD_CHANNEL_ID', required=True)
+            webhook_url = get_env_var('DISCORD_WEBHOOK_URL', required=True)
             check_interval_str = get_env_var('CHECK_INTERVAL', required=True)
 
             # Parse check interval
@@ -55,47 +54,40 @@ class FileWatcherService:
             self.state_manager = StateManager(state_file)
             self.file_watcher = create_from_env()
 
-            # Create Discord bot
-            self.bot = DiscordFileWatcherBot(int(channel_id))
+            # Create Discord webhook notifier
+            self.notifier = DiscordWebhookNotifier(webhook_url)
 
             logger.info("Service initialized successfully")
             logger.info(f"Watching folder: {watch_folder}")
             logger.info(f"State file: {state_file}")
 
-            return discord_token
-
         except Exception as e:
             logger.error(f"Failed to setup service: {e}")
             raise
 
-    async def run(self, discord_token: str):
-        """
-        Run the main service loop.
+    async def run(self):
+        """Run the main service loop."""
+        # Open the webhook session
+        logger.info("Opening Discord webhook session...")
+        await self.notifier.connect()
 
-        Args:
-            discord_token: Discord bot token
-        """
-        # Start Discord bot
-        logger.info("Starting Discord bot...")
-        asyncio.create_task(self.bot.start(discord_token))
+        logger.info("Webhook ready, starting file watcher loop...")
 
-        # Wait for bot to be ready
-        while not self.bot._connected:
-            await asyncio.sleep(1)
+        try:
+            # Main loop
+            while self.running:
+                try:
+                    await self.check_cycle()
 
-        logger.info("Bot connected, starting file watcher loop...")
+                except Exception as e:
+                    logger.error(f"Error in check cycle: {e}", exc_info=True)
 
-        # Main loop
-        while self.running:
-            try:
-                await self.check_cycle()
+                # Sleep until next check
+                logger.debug(f"Sleeping for {self.check_interval} seconds...")
+                await asyncio.sleep(self.check_interval)
 
-            except Exception as e:
-                logger.error(f"Error in check cycle: {e}", exc_info=True)
-
-            # Sleep until next check
-            logger.debug(f"Sleeping for {self.check_interval} seconds...")
-            await asyncio.sleep(self.check_interval)
+        finally:
+            await self.notifier.close()
 
     async def check_cycle(self):
         """Execute one check cycle."""
@@ -126,7 +118,7 @@ class FileWatcherService:
         # Process deleted files
         if deleted_files:
             logger.info(f"Processing {len(deleted_files)} deleted files")
-            await self.bot.send_deleted_files_notification(deleted_files)
+            await self.notifier.send_deleted_files_notification(deleted_files)
 
             # Remove deleted files from state
             for file_data in deleted_files:
@@ -239,7 +231,7 @@ class FileWatcherService:
         # Send notifications for stable files
         if stable_files:
             logger.info(f"Sending notifications for {len(stable_files)} stable file(s)")
-            await self.bot.send_new_files_notification(stable_files)
+            await self.notifier.send_new_files_notification(stable_files)
 
         if pending_count > 0:
             logger.info(f"Tracking {pending_count} file(s) still growing")
@@ -266,10 +258,10 @@ def main():
 
     try:
         service = FileWatcherService()
-        discord_token = service.setup()
+        service.setup()
 
         # Run the service
-        asyncio.run(service.run(discord_token))
+        asyncio.run(service.run())
 
     except Exception as e:
         logger.error(f"Service failed: {e}", exc_info=True)

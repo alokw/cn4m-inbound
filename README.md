@@ -1,13 +1,13 @@
 # Inbound
 
-Lightweight Docker service that watches a folder and pings your Discord when new files arrive.
+Lightweight Docker service that watches a folder and pings your Discord channel through a webhook when new files arrive.
 
 ## Features
 
 - 🔍 **Recursive folder scanning** - Monitors all subdirectories
 - 📁 **File tracking** - Maintains persistent state in JSON file
 - 🎯 **Smart growth detection** - Waits for large files to finish uploading before notifying
-- 🔔 **Discord notifications** - Get notified of new, deleted, or moved files
+- 🔔 **Discord notifications** - Get notified of new, deleted, or moved files via a channel webhook
 - 🌙 **Quiet hours** - Suppress notifications during sleep time, send summary in the morning
 - 📊 **Rich metadata** - Tracks file size, MIME type, modification time, and folder structure
 - 🐳 **Docker ready** - Simple deployment with Docker Compose
@@ -15,14 +15,14 @@ Lightweight Docker service that watches a folder and pings your Discord when new
 
 ## Quick Start
 
-### 1. Create a Discord Bot
+### 1. Create a Discord Webhook
 
-1. Go to [Discord Developer Portal](https://discord.com/developers/applications)
-2. Create a new application
-3. Go to the "Bot" section and create a bot
-4. Enable "MESSAGE CONTENT INTENT" (if required)
-5. Copy the bot token
-6. Get your Channel ID (enable Developer Mode in Discord, right-click channel)
+1. In Discord, open the target channel's settings (or **Server Settings → Integrations**)
+2. Go to **Integrations → Webhooks** and click **New Webhook**
+3. Give it a name and confirm the channel it posts to
+4. Click **Copy Webhook URL**
+
+No bot, no application, and no gateway connection is required — the service just POSTs to that URL. Treat the webhook URL like a password: anyone who has it can post to your channel.
 
 ### 2. Configure Environment Variables
 
@@ -39,8 +39,7 @@ Edit `.env` with your settings:
 WATCH_FOLDER=/path/to/folder/to/watch
 STATE_FILE=/path/to/state.json
 LOG_FILE=/path/to/watcher.log
-DISCORD_BOT_TOKEN=your_bot_token_here
-DISCORD_CHANNEL_ID=your_channel_id_here
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/your_webhook_id/your_webhook_token
 CHECK_INTERVAL=5m
 
 # Optional (with defaults shown)
@@ -82,8 +81,7 @@ docker-compose logs -f
 | `WATCH_FOLDER` | Host path to the folder to watch | `/mnt/files/incoming` |
 | `STATE_FILE` | Host path for the state JSON file | `/mnt/data/state.json` |
 | `LOG_FILE` | Host path for the watcher log file | `/mnt/data/watcher.log` |
-| `DISCORD_BOT_TOKEN` | Your Discord bot token | `MTIzNDU2Nzg5...` |
-| `DISCORD_CHANNEL_ID` | Discord channel ID for notifications | `123456789012345678` |
+| `DISCORD_WEBHOOK_URL` | Discord webhook URL for notifications | `https://discord.com/api/webhooks/123.../abc...` |
 | `CHECK_INTERVAL` | How often to check (with suffix) | `5m`, `30s`, `1h` |
 
 ### Optional Environment Variables
@@ -102,6 +100,15 @@ docker-compose logs -f
 
 Patterns are matched against both the full relative path and each individual folder/file name component. This means folder-based patterns like `System Volume Information` will automatically exclude everything inside that folder without needing a trailing `*`.
 
+**Do not add a trailing `/*` to a folder pattern.** A component is never matched against a pattern containing `/`, and the full-path match is anchored at the start, so `_ARCHIVE/*` only excludes an `_ARCHIVE` folder at the top level and silently misses `1400/_ARCHIVE/`. Use the bare folder name instead:
+
+```env
+# Excludes every _ARCHIVE folder at any depth
+EXCLUDE_PATTERNS=_ARCHIVE
+```
+
+Use `*_ARCHIVE*` only if you also want to match folders like `OLD_ARCHIVE` — note it will match *files* with `_ARCHIVE` in the name too.
+
 Spaces within pattern names are fine — values are split on commas only, not spaces. No quoting is needed.
 
 Supported glob characters:
@@ -111,6 +118,13 @@ Supported glob characters:
 | `*` | Matches anything (including nothing) |
 | `?` | Matches any single character |
 | `[seq]` | Matches any character in `seq` |
+
+**Matching a literal `$`:** Docker Compose interpolates `$NAME` in `.env` as a variable, so a pattern like `$Recycle.Bin` silently becomes `.Bin` (Compose also logs `The "Recycle" variable is not set`). Escape the dollar sign by doubling it:
+
+```env
+# Excludes the Windows Recycle Bin folder
+EXCLUDE_PATTERNS=$$Recycle.Bin
+```
 
 **Matching literal brackets:** Square brackets are special in glob syntax. To match a filename that literally contains `[` or `]` (e.g. `[Auto Save]`), escape them as `[[]` and `[]]`:
 
@@ -122,7 +136,7 @@ EXCLUDE_PATTERNS=*[[]Auto Save[]]*
 A typical set of patterns for Windows watch folders:
 
 ```env
-EXCLUDE_PATTERNS=System Volume Information,$Recycle.Bin,RECYCLE?,Recovery,thumbs.db,*.DS_*,*[[]Auto Save[]]*,*.tmp
+EXCLUDE_PATTERNS=System Volume Information,$$Recycle.Bin,RECYCLE?,Recovery,thumbs.db,*.DS_*,*[[]Auto Save[]]*,*.tmp
 ```
 
 ### Check Interval Format
@@ -260,12 +274,12 @@ echo '' > /path/to/state.json
 docker-compose restart
 ```
 
-### Bot not sending messages
+### Webhook not sending messages
 
-1. Verify bot token is correct
-2. Check bot has permission to send messages in the channel
-3. Check bot is invited to the server
-4. Verify `DISCORD_CHANNEL_ID` is correct
+1. Verify `DISCORD_WEBHOOK_URL` is complete and unquoted (it must include both the webhook ID and token)
+2. Check the webhook still exists in **Channel Settings → Integrations → Webhooks** — deleting it returns `404 Unknown Webhook`
+3. Check the logs for the HTTP status the service reports (`401`/`404` means a bad or deleted webhook, `429` means rate limiting)
+4. Confirm the container has outbound network access to `discord.com`
 
 ### Files not being detected
 
@@ -305,8 +319,7 @@ pip install -r requirements.txt
 export WATCH_FOLDER=./watch
 export STATE_FILE=./data/state.json
 export LOG_FILE=./data/watcher.log
-export DISCORD_BOT_TOKEN=your_token
-export DISCORD_CHANNEL_ID=your_channel_id
+export DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/your_webhook_id/your_webhook_token
 export CHECK_INTERVAL=30s
 
 # Run
