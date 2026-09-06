@@ -10,6 +10,8 @@ Lightweight Docker service that watches a folder and pings your Discord channel 
 - 🔔 **Discord notifications** - Get notified of new, deleted, or moved files via a channel webhook
 - 🌙 **Quiet hours** - Suppress notifications during sleep time, send summary in the morning
 - 📊 **Rich metadata** - Tracks file size, MIME type, modification time, and folder structure
+- 📟 **Status page** - Settings, live status, and an activity log on port 2645
+- 📡 **cn4m updates** - One-line status pushes to the parent system when a scan finds something
 - 🐳 **Docker ready** - Simple deployment with Docker Compose
 - ⚙️ **Configurable** - All settings via environment variables
 
@@ -95,6 +97,11 @@ docker-compose logs -f
 | `TIMEZONE` | Timezone for quiet hours | `UTC` |
 | `MIN_FILE_SIZE` | Only check files >= this size for growth (bytes) | `0` |
 | `EXCLUDE_PATTERNS` | Comma-separated glob patterns to ignore (matched against full relative path and each folder/file name component) | `~private*,*.tmp` |
+| `WEB_UI_ENABLED` | Serve the status page | `true` |
+| `WEB_UI_PORT` | Port for the status page | `2645` |
+| `WEB_UI_HOST` | Interface the status page binds | `0.0.0.0` |
+| `STATUS_URL` | cn4m status endpoint (empty disables updates) | `http://localhost:2640/suite/status` |
+| `STATUS_APP_NAME` | Name this service reports itself as to cn4m | `inbound` |
 
 ### Exclude Patterns
 
@@ -161,6 +168,16 @@ For large files (e.g., 100+ GB uploads that take hours), the service:
 
 This prevents notifications for files that are still uploading.
 
+A file is therefore announced after one scan to discover it plus
+`STABILITY_CHECKS` scans where its size did not move — so the delay between an
+upload finishing and the notification is about
+`(STABILITY_CHECKS + 1) x CHECK_INTERVAL`. With the defaults (`3` and `5m`)
+that is roughly 20 minutes. Any growth at any point resets the count.
+
+Files still being counted are listed on the [status page](#status-page) with
+their progress (`2 of 3 stable checks`), so a file that seems stuck is easy to
+tell apart from one that was never seen.
+
 ### Quiet Hours
 
 When quiet hours are enabled:
@@ -205,6 +222,112 @@ The service preserves full folder paths in notifications:
 • images/photo.jpg (2.4 MB, image/jpeg)
 ```
 
+## Status page
+
+The service serves a small read-only page on **port 2645**:
+
+```
+http://localhost:2645
+```
+
+It shows three things, refreshed every five seconds:
+
+- **Totals** — scans run, files discovered and removed, Discord submissions sent
+  and failed, cn4m updates sent and failed, and errors
+- **Live status and settings** — every setting the service is actually running
+  with, plus the last check time, next check countdown, quiet-hours state, file
+  and byte counts, and what was last said to cn4m
+- **Activity log** — recent successes, failures, and Discord submissions,
+  filterable by source (`scan`, `discord`, `cn4m`, `service`) and level
+
+The log lives in memory (the last 500 events) and is rebuilt from scratch on
+restart — `LOG_FILE` remains the durable record. Warnings and errors from
+anywhere in the service are mirrored into it automatically, so a failure shows
+up on the page whether or not the code that raised it knew about the page.
+
+Nothing on the page can change the running service, and the `DISCORD_WEBHOOK_URL`
+token is masked. There is no authentication, so bind it to a trusted network:
+
+```env
+WEB_UI_HOST=127.0.0.1
+```
+
+Two other endpoints are available for scripting:
+
+| Endpoint | Returns |
+|----------|---------|
+| `/api/status` | Settings, live status, and counters as JSON |
+| `/api/events` | Recent events as JSON (`?limit=`, `?category=`, `?level=`) |
+| `/healthz` | `ok`, for container health checks |
+
+Set `WEB_UI_ENABLED=false` to turn it off. If the port is already taken, the
+service logs the error and keeps watching — the page is never load-bearing.
+
+### Port mapping
+
+In Docker the container always listens on 2645; `WEB_UI_PORT` in `.env` chooses
+the **host** port it maps to. Running several instances side by side:
+
+```env
+# Instance 1 .env
+WEB_UI_PORT=2645
+
+# Instance 2 .env
+WEB_UI_PORT=2646
+```
+
+## Telling cn4m what happened
+
+Set `STATUS_URL` and every scan that finds something posts a one-line update:
+
+```
+POST http://<cn4m-host>:2640/suite/status
+app=inbound&message=Discovered+5+new+assets&level=working
+```
+
+Only scans that actually found something send anything — a quiet scan stays
+quiet, so the endpoint sees traffic when there is news rather than once a minute
+forever. Files are reported when they are *stable*, not when they first appear,
+so a large upload produces one update when it lands rather than one per scan
+while it grows. If known files also changed or disappeared, the message says so:
+`Discovered 5 new assets, refreshed 1, removed 2 files`.
+
+### localhost means the container
+
+`STATUS_URL` defaults to `http://localhost:2640/suite/status`, which is right
+when inbound runs directly on the same machine as cn4m. **Inside Docker,
+`localhost` is the container itself**, not the machine running Docker, so that
+default cannot reach a cn4m on the host. Use whichever applies:
+
+| Where cn4m runs | `STATUS_URL` |
+| --- | --- |
+| On the Docker host | `http://host.docker.internal:2640/suite/status` |
+| As another container | `http://<its service name>:2640/suite/status` |
+| Same machine, no Docker | `http://localhost:2640/suite/status` |
+
+`docker-compose.yml` maps `host.docker.internal` to the host gateway, so the
+first form works on Linux as well as Docker Desktop. If a localhost URL fails
+from inside a container, the log says all this rather than just reporting a
+refused connection.
+
+### When cn4m is not there
+
+A failing endpoint is left alone rather than retried every scan: after a failure
+updates pause for 60 seconds, then 2, 4, 8 minutes and so on up to 30, and the
+first success resets it. So an unset, wrong, or temporarily down cn4m costs one
+attempt and a single log line, not a broken request every scan. An HTTP error
+such as a 404 backs off the same way a refused connection does.
+
+Updates go out as detached tasks and swallow their errors, so a cn4m that is
+slow, down, or not there at all cannot delay or interrupt watching. A failure is
+logged once at `WARNING`, then at `DEBUG` until it recovers. Setting `STATUS_URL`
+empty disables the whole thing. In-flight updates get a moment to finish on
+shutdown, which is what makes the update from the last scan before
+`docker stop` actually arrive.
+
+The current backoff state and the last message sent are both shown on the status
+page, so you can tell at a glance whether cn4m is hearing from this service.
+
 ## Docker Volume Mapping
 
 `WATCH_FOLDER`, `STATE_FILE`, and `LOG_FILE` in `.env` are host paths that get bind-mounted into the container automatically. There is no need to edit `docker-compose.yml` for different instances — just point each `.env` to different host paths.
@@ -224,6 +347,8 @@ LOG_FILE=/mnt/data/show_b.log
 ```
 
 ## Monitoring
+
+The quickest look is the [status page](#status-page) on port 2645.
 
 View service logs:
 
@@ -281,6 +406,26 @@ docker-compose restart
 3. Check the logs for the HTTP status the service reports (`401`/`404` means a bad or deleted webhook, `429` means rate limiting)
 4. Confirm the container has outbound network access to `discord.com`
 
+### Status page not reachable
+
+1. Confirm `WEB_UI_ENABLED` is not `false`
+2. Check the startup logs for `Web UI listening on ...` — if the port was already
+   taken the service logs the error and carries on watching without the page
+3. In Docker, check the host port mapping (`docker-compose ps`); the container
+   always listens on 2645 regardless of `WEB_UI_PORT`
+4. If `WEB_UI_HOST` is `127.0.0.1` the page is unreachable from outside the
+   container — use `0.0.0.0` and rely on the port mapping to limit exposure
+
+### cn4m is not receiving updates
+
+1. Look at **cn4m last result** and **cn4m backoff** on the status page
+2. A quiet scan sends nothing by design — updates only go out when a scan finds,
+   refreshes, or loses files
+3. Inside Docker, `localhost` is the container; see
+   [localhost means the container](#localhost-means-the-container)
+4. After a failure updates pause and the gap doubles, so a fix may take up to
+   30 minutes to be retried — restart the container to retry immediately
+
 ### Files not being detected
 
 1. Check volume mappings are correct
@@ -321,9 +466,18 @@ export STATE_FILE=./data/state.json
 export LOG_FILE=./data/watcher.log
 export DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/your_webhook_id/your_webhook_token
 export CHECK_INTERVAL=30s
+export STATUS_URL=http://localhost:2640/suite/status
 
 # Run
 python -m src.main
+```
+
+The status page is then at <http://localhost:2645>.
+
+```bash
+# Watch what it is reporting without opening a browser
+curl -s localhost:2645/api/status | jq .live
+curl -s "localhost:2645/api/events?level=error" | jq -r '.events[].message'
 ```
 
 ## License

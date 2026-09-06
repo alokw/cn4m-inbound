@@ -8,6 +8,12 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+# Used when a caller does not pass STABILITY_CHECKS through
+DEFAULT_STABILITY_CHECKS = 3
+
+# How many recent sizes to keep per pending file, for diagnostics only
+MAX_SIZE_HISTORY = 10
+
 
 class StateManager:
     """Manages persistent state of tracked files."""
@@ -207,13 +213,22 @@ class StateManager:
                 'stable_checks': 0,
             }
 
-    def update_pending_file_stability(self, file_path: str, stable: bool) -> Optional[Dict[str, Any]]:
+    def update_pending_file_stability(
+        self,
+        file_path: str,
+        stable: bool,
+        size: Optional[int] = None,
+        required_checks: int = DEFAULT_STABILITY_CHECKS,
+    ) -> Optional[Dict[str, Any]]:
         """
-        Update stability check count for pending file.
+        Record one observation of a pending file.
 
         Args:
             file_path: Relative path to file
-            stable: Whether file size is stable (unchanged)
+            stable: Whether file size is unchanged since the last observation
+            size: Current file size, stored so the next check compares against
+                what was actually seen this time rather than the first size ever
+            required_checks: Consecutive unchanged checks needed to settle
 
         Returns:
             Pending file state if stability threshold reached, None otherwise
@@ -228,8 +243,15 @@ class StateManager:
         else:
             pending['stable_checks'] = 0
 
+        if size is not None and size != pending['size']:
+            pending['size'] = size
+            pending['previous_sizes'].append(size)
+            # Only the recent history is useful, and a slow upload would
+            # otherwise add one entry per check for hours
+            del pending['previous_sizes'][:-MAX_SIZE_HISTORY]
+
         # Return file state if stable (caller should move to main files dict)
-        return pending if pending['stable_checks'] >= 3 else None
+        return pending if pending['stable_checks'] >= max(1, required_checks) else None
 
     def remove_pending_file(self, file_path: str) -> bool:
         """

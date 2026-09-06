@@ -3,6 +3,10 @@ services:
     build: .
     container_name: inbound
     restart: unless-stopped
+    ports:
+      - "${WEB_UI_PORT:-2645}:2645"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ${WATCH_FOLDER:-./watch}:/watch
       - ${STATE_FILE:-./data/state.json}:/state.json
@@ -13,3 +17,4 @@ services:
       - WATCH_FOLDER=/watch
       - STATE_FILE=/state.json
       - LOG_FILE=/watcher.log
+      - WEB_UI_PORT=2645

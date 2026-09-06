@@ -8,6 +8,8 @@ import sys
 import time
 from datetime import datetime, timezone
 
+from src import status_reporter, web_ui
+from src.activity_log import ActivityLog, ActivityLogHandler
 from src.discord_webhook import DiscordWebhookNotifier
 from src.file_watcher import FileWatcher, create_from_env
 from src.state_manager import StateManager
@@ -37,9 +39,23 @@ class FileWatcherService:
         self.file_watcher = None
         self.check_interval = None
 
+        # Shared by the watcher loop and the web UI
+        self.activity_log = ActivityLog()
+        self.status_pusher = None
+        self.web_ui = None
+
+        # Wall clock of the last completed cycle, used for the "next check" countdown
+        self.last_check_wallclock = None
+
+        self._loop = None
+        self._stop_event = None
+
     def setup(self):
         """Setup the service with configuration from environment."""
         try:
+            # Mirror warnings and errors from anywhere in the service into the web UI
+            logging.getLogger().addHandler(ActivityLogHandler(self.activity_log))
+
             # Load required environment variables
             watch_folder = get_env_var('WATCH_FOLDER', required=True)
             state_file = get_env_var('STATE_FILE', required=True)
@@ -57,9 +73,19 @@ class FileWatcherService:
             # Create Discord webhook notifier
             self.notifier = DiscordWebhookNotifier(webhook_url)
 
+            # Status updates to cn4m and the local status page
+            self.status_pusher = status_reporter.create_from_env(self.activity_log)
+            self.web_ui = web_ui.create_from_env(self)
+
             logger.info("Service initialized successfully")
             logger.info(f"Watching folder: {watch_folder}")
             logger.info(f"State file: {state_file}")
+
+            self.activity_log.record(
+                'service',
+                f"Service started, watching {watch_folder} every {self.check_interval}s",
+                level='success',
+            )
 
         except Exception as e:
             logger.error(f"Failed to setup service: {e}")
@@ -67,9 +93,14 @@ class FileWatcherService:
 
     async def run(self):
         """Run the main service loop."""
+        self._loop = asyncio.get_event_loop()
+        self._stop_event = asyncio.Event()
+
         # Open the webhook session
         logger.info("Opening Discord webhook session...")
         await self.notifier.connect()
+        await self.status_pusher.connect()
+        await self.start_web_ui()
 
         logger.info("Webhook ready, starting file watcher loop...")
 
@@ -82,12 +113,35 @@ class FileWatcherService:
                 except Exception as e:
                     logger.error(f"Error in check cycle: {e}", exc_info=True)
 
-                # Sleep until next check
+                # Sleep until next check, waking early on shutdown
                 logger.debug(f"Sleeping for {self.check_interval} seconds...")
-                await asyncio.sleep(self.check_interval)
+                try:
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=self.check_interval)
+                    break
+                except asyncio.TimeoutError:
+                    pass
 
         finally:
             await self.notifier.close()
+            await self.status_pusher.close()
+            if self.web_ui:
+                await self.web_ui.stop()
+
+    async def start_web_ui(self):
+        """Start the status page, leaving the watcher running if the port is taken."""
+        if not self.web_ui:
+            return
+
+        try:
+            await self.web_ui.start()
+            self.activity_log.record(
+                'service',
+                f"Web UI listening on port {self.web_ui.port}",
+                level='success',
+            )
+        except Exception as e:
+            logger.error(f"Failed to start web UI on port {self.web_ui.port}: {e}")
+            self.web_ui = None
 
     async def check_cycle(self):
         """Execute one check cycle."""
@@ -105,6 +159,8 @@ class FileWatcherService:
             logger.info("Currently in quiet hours, skipping check")
             return
 
+        self.activity_log.bump('scans')
+
         # Scan folder for files
         current_files = self.file_watcher.scan_folder()
         tracked_files = self.state_manager.get_all_files()
@@ -118,7 +174,9 @@ class FileWatcherService:
         # Process deleted files
         if deleted_files:
             logger.info(f"Processing {len(deleted_files)} deleted files")
-            await self.notifier.send_deleted_files_notification(deleted_files)
+            sent = await self.notifier.send_deleted_files_notification(deleted_files)
+            self.record_discord_result(sent, f"{len(deleted_files)} deleted file(s)")
+            self.activity_log.bump('files_deleted', len(deleted_files))
 
             # Remove deleted files from state
             for file_data in deleted_files:
@@ -126,7 +184,16 @@ class FileWatcherService:
                 self.state_manager.remove_pending_file(file_data['path'])
 
         # Process new and modified files
-        await self.process_files(new_files, modified_files)
+        stable_new, stable_modified = await self.process_files(new_files, modified_files)
+
+        # Tell cn4m, but only when the scan actually had news
+        message = status_reporter.discovery_message(
+            new_count=len(stable_new),
+            refreshed_count=len(stable_modified),
+            removed_count=len(deleted_files),
+        )
+        if message:
+            self.status_pusher.send(message)
 
         # Send summary if coming out of quiet hours and found files
         if was_in_quiet_hours and not in_quiet_hours:
@@ -138,6 +205,7 @@ class FileWatcherService:
         # Update last check timestamp
         self.state_manager.update_last_check(now)
         self.state_manager.save_state()
+        self.last_check_wallclock = time.time()
 
         logger.info("Check cycle completed")
 
@@ -148,8 +216,12 @@ class FileWatcherService:
         Args:
             new_files: List of new file metadata
             modified_files: List of modified file metadata
+
+        Returns:
+            Tuple of (stable new files, stable modified files)
         """
         all_files = new_files + modified_files
+        modified_paths = {f['relative_path'] for f in modified_files}
         stable_files = []
         pending_count = 0
 
@@ -178,22 +250,27 @@ class FileWatcherService:
             is_stable = False
 
             if pending_file:
-                # File is already being tracked for growth
+                # File is already being tracked for growth. The comparison is
+                # against the size seen on the previous check, and passing the
+                # current size back keeps it that way for the next one.
                 previous_size = pending_file['size']
-                is_stable = self.file_watcher.check_file_stability(path, size, previous_size)
+                unchanged = self.file_watcher.check_file_stability(path, size, previous_size)
 
-                if is_stable:
-                    stable_result = self.state_manager.update_pending_file_stability(path, True)
-                    if stable_result:
-                        # File is now stable
-                        is_stable = True
-                        self.state_manager.remove_pending_file(path)
-                        logger.info(f"File {path} is now stable after growth")
-                    else:
-                        pending_count += 1
+                settled = self.state_manager.update_pending_file_stability(
+                    path,
+                    stable=unchanged,
+                    size=size,
+                    required_checks=self.file_watcher.stability_checks,
+                )
+
+                if settled:
+                    # Size held steady for the full run of checks
+                    is_stable = True
+                    self.state_manager.remove_pending_file(path)
+                    logger.info(f"File {path} is now stable after growth")
                 else:
-                    # Still growing, reset counter
-                    self.state_manager.update_pending_file_stability(path, False)
+                    # Either still growing, or not yet held steady long enough
+                    is_stable = False
                     pending_count += 1
 
             else:
@@ -231,34 +308,70 @@ class FileWatcherService:
         # Send notifications for stable files
         if stable_files:
             logger.info(f"Sending notifications for {len(stable_files)} stable file(s)")
-            await self.notifier.send_new_files_notification(stable_files)
+            sent = await self.notifier.send_new_files_notification(stable_files)
+            self.record_discord_result(
+                sent,
+                f"{len(stable_files)} new file(s)",
+                detail='\n'.join(f['relative_path'] for f in sorted(
+                    stable_files, key=lambda f: f['relative_path']
+                )[:25]),
+            )
+            self.activity_log.bump('files_discovered', len(stable_files))
 
         if pending_count > 0:
             logger.info(f"Tracking {pending_count} file(s) still growing")
+
+        stable_new = [f for f in stable_files if f['relative_path'] not in modified_paths]
+        stable_modified = [f for f in stable_files if f['relative_path'] in modified_paths]
+
+        return stable_new, stable_modified
+
+    def record_discord_result(self, sent: bool, what: str, detail: str = None):
+        """
+        Record the outcome of a Discord submission in the activity log.
+
+        Args:
+            sent: Whether the webhook accepted the message
+            what: Short description of what was submitted
+            detail: Optional longer text shown under the entry
+        """
+        if sent:
+            self.activity_log.record(
+                'discord', f"Submitted {what} to Discord", level='success', detail=detail
+            )
+            self.activity_log.bump('discord_sent')
+        else:
+            # The reason was already logged by the notifier and mirrored as an error
+            self.activity_log.record(
+                'discord', f"Failed to submit {what} to Discord", level='error', detail=detail
+            )
+            self.activity_log.bump('discord_failed')
 
     def stop(self):
         """Stop the service gracefully."""
         logger.info("Stopping service...")
         self.running = False
 
-
-def signal_handler(signum, frame):
-    """Handle shutdown signals."""
-    logger.info(f"Received signal {signum}, shutting down...")
-    sys.exit(0)
+        # Wake the loop out of its sleep so shutdown is not delayed a whole interval
+        if self._loop and self._stop_event:
+            self._loop.call_soon_threadsafe(self._stop_event.set)
 
 
 def main():
     """Main entry point."""
-    # Setup signal handlers
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
     logger.info("Starting Discord File Watcher Service...")
 
     try:
         service = FileWatcherService()
         service.setup()
+
+        def signal_handler(signum, frame):
+            """Handle shutdown signals."""
+            logger.info(f"Received signal {signum}, shutting down...")
+            service.stop()
+
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
 
         # Run the service
         asyncio.run(service.run())
