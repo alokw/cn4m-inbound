@@ -4,7 +4,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -252,6 +252,54 @@ class StateManager:
 
         # Return file state if stable (caller should move to main files dict)
         return pending if pending['stable_checks'] >= max(1, required_checks) else None
+
+    def reconcile_pending(self, current_paths: Set[str]) -> Tuple[List[str], List[str]]:
+        """
+        Drop pending entries that can never settle.
+
+        A pending file only leaves the list when it settles or when it is seen
+        to be deleted, and neither happens for two kinds of leftovers:
+
+        - entries whose file was already promoted to stable at that same size,
+          which is stale bookkeeping rather than a file that is still growing
+        - entries whose file was renamed or removed before it settled, which
+          delete detection never sees because it only looks at tracked files
+
+        A tracked file that is being modified is legitimately in both lists at
+        once, so the size has to match before an entry counts as stale - a
+        pending size that differs from the tracked one is a change in flight.
+
+        Args:
+            current_paths: Relative paths present in the scan just completed
+
+        Returns:
+            Tuple of (paths already stable, paths no longer present)
+        """
+        already_stable = [
+            path for path, pending in self.state['pending_files'].items()
+            if path in self.state['files']
+            and pending['size'] == self.state['files'][path]['size']
+        ]
+        vanished = [
+            path for path in self.state['pending_files']
+            if path not in current_paths and path not in already_stable
+        ]
+
+        for path in already_stable + vanished:
+            del self.state['pending_files'][path]
+
+        if already_stable:
+            logger.info(
+                f"Cleared {len(already_stable)} pending entr(ies) for files "
+                f"already tracked as stable"
+            )
+        if vanished:
+            logger.info(
+                f"Cleared {len(vanished)} pending entr(ies) for files that "
+                f"disappeared before settling"
+            )
+
+        return already_stable, vanished
 
     def remove_pending_file(self, file_path: str) -> bool:
         """

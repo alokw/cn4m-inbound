@@ -165,6 +165,8 @@ class FileWatcherService:
         current_files = self.file_watcher.scan_folder()
         tracked_files = self.state_manager.get_all_files()
 
+        self.reconcile_pending(current_files, tracked_files)
+
         # Detect changes
         new_files, modified_files, deleted_files = self.file_watcher.detect_changes(
             current_files,
@@ -325,6 +327,49 @@ class FileWatcherService:
         stable_modified = [f for f in stable_files if f['relative_path'] in modified_paths]
 
         return stable_new, stable_modified
+
+    def reconcile_pending(self, current_files: dict, tracked_files: dict):
+        """
+        Clear pending entries that can never settle.
+
+        Without this, two kinds of entry accumulate forever and make the growing
+        file count meaningless: files already promoted to stable, and files
+        renamed or removed before they settled (delete detection never sees
+        those, because it only looks at files that reached the tracked list).
+
+        Args:
+            current_files: Files present in the scan just completed
+            tracked_files: Files already tracked as stable
+        """
+        if not current_files and tracked_files:
+            # An empty scan against a non-empty state means the watch folder is
+            # unreadable, not that everything vanished. Leave the state alone.
+            logger.warning(
+                "Scan returned no files while tracking "
+                f"{len(tracked_files)}, skipping pending cleanup"
+            )
+            return
+
+        already_stable, vanished = self.state_manager.reconcile_pending(set(current_files))
+
+        if already_stable:
+            self.activity_log.record(
+                'scan',
+                f"Cleared {len(already_stable)} stale pending entr"
+                f"{'y' if len(already_stable) == 1 else 'ies'} for files already stable",
+                level='info',
+                detail='\n'.join(sorted(already_stable)[:25]),
+            )
+
+        if vanished:
+            self.activity_log.record(
+                'scan',
+                f"Cleared {len(vanished)} pending entr"
+                f"{'y' if len(vanished) == 1 else 'ies'} for files that disappeared "
+                "before settling",
+                level='info',
+                detail='\n'.join(sorted(vanished)[:25]),
+            )
 
     def record_discord_result(self, sent: bool, what: str, detail: str = None):
         """

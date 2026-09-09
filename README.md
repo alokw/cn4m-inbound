@@ -178,6 +178,30 @@ Files still being counted are listed on the [status page](#status-page) with
 their progress (`2 of 3 stable checks`), so a file that seems stuck is easy to
 tell apart from one that was never seen.
 
+### Pending entries are reconciled every scan
+
+A file leaves the pending list when it settles or when it is seen to be deleted.
+Two cases fit neither, so each scan clears them explicitly:
+
+- **Already stable at the same size** — bookkeeping left behind rather than a
+  file that is still growing
+- **Renamed or removed before settling** — delete detection never sees these,
+  because it only looks at files that made it to the tracked list. Renaming a
+  file mid-upload (`v003` to `v004`, adding ` - Copy`) is the usual way to
+  create one
+
+A tracked file that is *being modified* is legitimately in both lists at once,
+so an entry only counts as stale when its pending size matches the tracked size.
+An in-flight change keeps its place in the queue and is announced when it
+settles.
+
+If a scan comes back empty while files are still tracked, the watch folder is
+unreadable rather than empty — the cleanup is skipped and a warning logged, so a
+dropped network mount cannot flush the state.
+
+Cleanups appear in the activity log, so a large one-off clear is visible rather
+than silent.
+
 ### Quiet Hours
 
 When quiet hours are enabled:
@@ -282,7 +306,7 @@ Set `STATUS_URL` and every scan that finds something posts a one-line update:
 
 ```
 POST http://<cn4m-host>:2640/suite/status
-app=inbound&message=Discovered+5+new+assets&level=working
+app=inbound&message=Discovered+5+new+assets&level=ok
 ```
 
 Only scans that actually found something send anything — a quiet scan stays
@@ -382,6 +406,18 @@ export BUILDX_NO_DEFAULT_PROVENANCE=1
 # Windows (PowerShell)
 $env:BUILDX_NO_DEFAULT_PROVENANCE=1
 ```
+
+### Files stuck as "still growing"
+
+The status page counting files that finished uploading long ago means pending
+entries were left behind. Every scan now clears both causes automatically, so
+one check cycle after upgrading the count corrects itself — no state reset is
+needed, and the tracked files are not touched. The activity log records what was
+cleared.
+
+If a file is genuinely stuck at `0 of N stable checks`, its size is changing on
+every scan: either it is still being written, or something is touching it
+repeatedly. Compare its size across two entries in `LOG_FILE` to tell which.
 
 ### Resetting state to redetect all files
 

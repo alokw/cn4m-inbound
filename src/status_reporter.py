@@ -3,11 +3,18 @@
 Equivalent to:
 
     curl -X POST http://<cn4m-host>:2640/suite/status \
-         -d app=inbound -d message="Discovered 5 new assets" -d level=working
+         -d app=inbound -d message="Discovered 5 new assets" -d level=ok
 
 One line per scan that actually had news. Everything here is best effort: a
 status update is never worth delaying or interrupting a scan for, so a cn4m
 that is slow, down, or missing entirely changes nothing about watching.
+
+``level`` is one of ``idle``, ``ok``, ``working``, ``warning``, ``blocked`` or
+``error``. cn4m owns that list and what each one means - see ``LEVELS`` in
+``cn4m/app/suite_status.py`` and the Suite status feed section of cn4m's README.
+Nothing here validates it: an unrecognised level is not an error, it is
+lowercased and falls back to ``idle``, so a typo costs a colour rather than a
+message and nothing is reported back.
 """
 
 import asyncio
@@ -77,7 +84,7 @@ class StatusPusher:
         self,
         url: Optional[str],
         app: str = DEFAULT_APP_NAME,
-        level: str = 'working',
+        level: str = 'ok',
         timeout: int = REQUEST_TIMEOUT,
         activity_log: Optional[ActivityLog] = None,
     ):
@@ -87,7 +94,9 @@ class StatusPusher:
         Args:
             url: cn4m status endpoint, or empty/None to disable updates
             app: Name this service reports itself as
-            level: Default cn4m level tag
+            level: Default cn4m level tag. "ok" rather than "working" because
+                every update this service sends describes a scan that has
+                already finished - there is no in-progress state to report
             timeout: Per-request timeout in seconds
             activity_log: Optional activity log to record attempts into
         """
