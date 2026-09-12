@@ -101,6 +101,8 @@ docker-compose logs -f
 | `WEB_UI_ENABLED` | Serve the status page | `true` |
 | `WEB_UI_PORT` | Port for the status page | `2645` |
 | `WEB_UI_HOST` | Interface the status page binds | `0.0.0.0` |
+| `MANUAL_STABILITY_CHECKS` | Steady checks a file needs when scanned from the **Scan now** button | `1` |
+| `MANUAL_SETTLE_SECONDS` | Seconds between those checks | `5` |
 | `STATUS_URL` | cn4m status endpoint (empty disables updates) | `http://host.docker.internal:2640/suite/status` in Docker, `localhost` otherwise |
 | `STATUS_APP_NAME` | Name this service reports itself as to cn4m | `inbound` |
 | `SYMMETRY_RESCAN_URL` | symmetry rescan endpoint (empty disables triggers) | `http://host.docker.internal:2647/api/rescan` in Docker, `localhost` otherwise |
@@ -272,20 +274,51 @@ restart — `LOG_FILE` remains the durable record. Warnings and errors from
 anywhere in the service are mirrored into it automatically, so a failure shows
 up on the page whether or not the code that raised it knew about the page.
 
-Nothing on the page can change the running service, and the `DISCORD_WEBHOOK_URL`
-token is masked. There is no authentication, so bind it to a trusted network:
+Nothing on the page changes settings, and the `DISCORD_WEBHOOK_URL` token is
+masked. The one control is **Scan now**, described below. There is no
+authentication, so bind it to a trusted network:
 
 ```env
 WEB_UI_HOST=127.0.0.1
 ```
 
-Two other endpoints are available for scripting:
+The endpoints behind it are available for scripting:
 
-| Endpoint | Returns |
-|----------|---------|
-| `/api/status` | Settings, live status, and counters as JSON |
-| `/api/events` | Recent events as JSON (`?limit=`, `?category=`, `?level=`) |
-| `/healthz` | `ok`, for container health checks |
+| Endpoint | | |
+|----------|---|---|
+| `/api/status` | GET | Settings, live status, and counters as JSON |
+| `/api/events` | GET | Recent events as JSON (`?limit=`, `?category=`, `?level=`) |
+| `/api/scan` | POST | Queue a manual scan; returns `{"queued": true}` or `false` if one is already running |
+| `/healthz` | GET | `ok`, for container health checks |
+
+### Scan now
+
+When you know a file has just finished landing, **Scan now** on the status page
+(or `curl -X POST localhost:2645/api/scan`) checks for it immediately instead of
+waiting for the next interval — and with a shorter settle period, since you are
+telling it the file is done.
+
+A scheduled scan announces a file after `STABILITY_CHECKS` consecutive scans
+where its size did not move, one `CHECK_INTERVAL` apart — with the defaults,
+about two minutes after an upload finishes. A manual scan applies the same rule
+with both numbers shrunk: `MANUAL_STABILITY_CHECKS` steady checks (default `1`)
+taken `MANUAL_SETTLE_SECONDS` apart (default `5`). It runs one pass to discover,
+then one per required check, and stops as soon as nothing is left pending. A
+file that was already waiting is announced on the first pass; a brand-new one
+about five seconds after the click.
+
+The size check is not skipped, only compressed. A file that grows between the
+passes is left pending exactly as it would be on a scheduled scan — the button
+never announces something still being written. The trade-off is the window: a
+transfer that pauses for longer than `MANUAL_SETTLE_SECONDS` mid-file could
+look settled to a manual scan where the scheduled one would have caught it.
+Raise the settle time or the check count if that ever bites.
+
+Everything that follows a scheduled announcement follows a manual one too:
+Discord, the cn4m status line, and the symmetry trigger. Quiet hours are
+ignored — a click is intent. A click during a scheduled scan is picked up as
+soon as it finishes; a click during a manual scan is absorbed, since one is
+already running. The page shows which pass it is on while it works.
 
 Set `WEB_UI_ENABLED=false` to turn it off. If the port is already taken, the
 service logs the error and keeps watching — the page is never load-bearing.

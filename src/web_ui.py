@@ -1,8 +1,9 @@
 """Small read-only web UI showing settings, live status, and recent activity.
 
 Served by aiohttp alongside the watcher loop, so it adds no dependencies and
-no extra process. Everything it exposes is read-only - there are no controls
-that can change the running service.
+no extra process. Nothing here changes settings. The one control is "scan
+now", which asks the watcher loop for a manual scan - the page never runs a
+scan itself, so it cannot race the scheduled one.
 """
 
 import logging
@@ -99,6 +100,7 @@ class WebUI:
         app.router.add_get('/api/status', self.handle_status)
         app.router.add_get('/api/events', self.handle_events)
         app.router.add_get('/healthz', self.handle_health)
+        app.router.add_post('/api/scan', self.handle_scan)
 
         self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
@@ -127,6 +129,22 @@ class WebUI:
             HTML response
         """
         return web.Response(text=PAGE_HTML, content_type='text/html')
+
+    async def handle_scan(self, request: web.Request) -> web.Response:
+        """
+        Ask the watcher loop for a manual scan.
+
+        Args:
+            request: Incoming request
+
+        Returns:
+            JSON with whether it was queued and what the loop is doing now
+        """
+        queued = self.service.request_scan()
+        return web.json_response({
+            'queued': queued,
+            'state': self.service.scan_state,
+        })
 
     async def handle_health(self, request: web.Request) -> web.Response:
         """
@@ -209,6 +227,7 @@ class WebUI:
                 'started_at': activity.started_at.isoformat(),
                 'uptime': _humanize_seconds(activity.uptime_seconds()),
                 'running': service.running,
+                'scan_state': service.scan_state,
             },
             'settings': {
                 'Watch folder': str(watcher.watch_folder) if watcher else 'unknown',
@@ -230,11 +249,16 @@ class WebUI:
                 'cn4m app name': reporter.app if reporter else '-',
                 'symmetry rescan URL': rescan.url if rescan and rescan.enabled else 'disabled',
                 'symmetry token': 'set' if rescan and rescan.token else 'none',
+                'Manual scan': (
+                    f"{service.manual_stability_checks} stable check(s), "
+                    f"passes {service.manual_settle_seconds}s apart"
+                ),
                 'Web UI': f"{self.host}:{self.port}",
             },
             'live': {
                 'Last check': last_check or 'not yet',
                 'Next check in': f"{next_check_in}s" if next_check_in is not None else 'unknown',
+                'Scanning': service.scan_state,
                 'Quiet hours now': 'yes' if (watcher and watcher.is_quiet_hours()) else 'no',
                 'Files tracked': len(tracked),
                 'Files pending (still growing)': len(pending),
@@ -316,6 +340,9 @@ PAGE_HTML = """<!doctype html>
   .dot.stale { background: var(--err); }
   .spacer { flex: 1; }
   header .meta { color: var(--muted); font-size: 12px; font-family: var(--mono); }
+  #scan-now { font-weight: 600; }
+  #scan-now:disabled { opacity: .55; cursor: default; border-color: var(--line); }
+  #scan-state { color: var(--warn); font-size: 12px; font-family: var(--mono); }
   main { padding: 20px; max-width: 1240px; margin: 0 auto; display: grid; gap: 16px; }
   .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
   section {
@@ -368,6 +395,8 @@ PAGE_HTML = """<!doctype html>
   <h1>inbound</h1>
   <span class="meta" id="uptime"></span>
   <span class="spacer"></span>
+  <span id="scan-state"></span>
+  <button id="scan-now" title="Scan the watch folder now, with a shorter stability check">Scan now</button>
   <span class="meta" id="refreshed"></span>
 </header>
 
@@ -429,6 +458,7 @@ const TILES = [
   ['rescan_sent', 'symmetry sent', 'ok'],
   ['rescan_failed', 'symmetry failed', 'err'],
   ['errors', 'Errors', 'err'],
+  ['manual_scans', 'Manual scans', ''],
 ];
 
 let live = true;
@@ -481,6 +511,10 @@ async function loadStatus() {
     sec.hidden = true;
   }
 
+  const manual = d.service.scan_state.startsWith('manual');
+  document.getElementById('scan-state').textContent = manual ? d.service.scan_state : '';
+  document.getElementById('scan-now').disabled = manual;
+
   document.getElementById('refreshed').textContent =
     'refreshed ' + new Date().toLocaleTimeString(undefined, { hour12: false });
 }
@@ -519,6 +553,26 @@ async function refresh() {
 
 document.getElementById('f-cat').onchange = loadEvents;
 document.getElementById('f-lvl').onchange = loadEvents;
+document.getElementById('scan-now').onclick = async (e) => {
+  e.target.disabled = true;
+  try {
+    const r = await fetch('api/scan', { method: 'POST' });
+    const d = await r.json();
+    document.getElementById('scan-state').textContent =
+      d.queued ? 'scan queued' : d.state;
+  } catch (err) {
+    document.getElementById('scan-state').textContent = 'request failed';
+    e.target.disabled = false;
+  }
+  // Poll quickly while the scan runs so the state and log keep up
+  let ticks = 0;
+  const fast = setInterval(async () => {
+    await refresh();
+    const busy = document.getElementById('scan-now').disabled;
+    if (!busy || ++ticks > 60) clearInterval(fast);
+  }, 1000);
+};
+
 document.getElementById('pause').onclick = (e) => {
   live = !live;
   e.target.textContent = live ? 'Pause auto-refresh' : 'Resume auto-refresh';

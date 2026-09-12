@@ -38,6 +38,7 @@ class ActivityLog:
             'status_failed': 0,
             'rescan_sent': 0,
             'rescan_failed': 0,
+            'manual_scans': 0,
             'errors': 0,
         }
         self._next_id = 1
