@@ -8,7 +8,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
-from src import status_reporter, web_ui
+from src import rescan_trigger, status_reporter, web_ui
 from src.activity_log import ActivityLog, ActivityLogHandler
 from src.discord_webhook import DiscordWebhookNotifier
 from src.file_watcher import FileWatcher, create_from_env
@@ -42,6 +42,7 @@ class FileWatcherService:
         # Shared by the watcher loop and the web UI
         self.activity_log = ActivityLog()
         self.status_pusher = None
+        self.rescan_trigger = None
         self.web_ui = None
 
         # Wall clock of the last completed cycle, used for the "next check" countdown
@@ -75,6 +76,7 @@ class FileWatcherService:
 
             # Status updates to cn4m and the local status page
             self.status_pusher = status_reporter.create_from_env(self.activity_log)
+            self.rescan_trigger = rescan_trigger.create_from_env(self.activity_log)
             self.web_ui = web_ui.create_from_env(self)
 
             logger.info("Service initialized successfully")
@@ -100,6 +102,7 @@ class FileWatcherService:
         logger.info("Opening Discord webhook session...")
         await self.notifier.connect()
         await self.status_pusher.connect()
+        await self.rescan_trigger.connect()
         await self.start_web_ui()
 
         logger.info("Webhook ready, starting file watcher loop...")
@@ -124,6 +127,7 @@ class FileWatcherService:
         finally:
             await self.notifier.close()
             await self.status_pusher.close()
+            await self.rescan_trigger.close()
             if self.web_ui:
                 await self.web_ui.stop()
 
@@ -309,6 +313,10 @@ class FileWatcherService:
 
         # Send notifications for stable files
         if stable_files:
+            # symmetry first: it is non-blocking, and the point is that it
+            # links these before its own scan would have got round to them
+            self.rescan_trigger.send(f['relative_path'] for f in stable_files)
+
             logger.info(f"Sending notifications for {len(stable_files)} stable file(s)")
             sent = await self.notifier.send_new_files_notification(stable_files)
             self.record_discord_result(

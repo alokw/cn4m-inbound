@@ -189,6 +189,7 @@ class WebUI:
         state = service.state_manager
         activity = service.activity_log
         reporter = service.status_pusher
+        rescan = service.rescan_trigger
 
         tracked = state.get_all_files() if state else {}
         pending = state.get_pending_files() if state else {}
@@ -227,6 +228,8 @@ class WebUI:
                 'Discord webhook': redact_webhook(os.getenv('DISCORD_WEBHOOK_URL')),
                 'cn4m status URL': reporter.url if reporter and reporter.enabled else 'disabled',
                 'cn4m app name': reporter.app if reporter else '-',
+                'symmetry rescan URL': rescan.url if rescan and rescan.enabled else 'disabled',
+                'symmetry token': 'set' if rescan and rescan.token else 'none',
                 'Web UI': f"{self.host}:{self.port}",
             },
             'live': {
@@ -239,6 +242,9 @@ class WebUI:
                 'cn4m last message': (reporter.last_message or 'none') if reporter else 'none',
                 'cn4m last result': (reporter.last_result or 'not attempted') if reporter else 'disabled',
                 'cn4m backoff': (reporter.describe_backoff() or 'none') if reporter else 'n/a',
+                'symmetry last request': (rescan.last_message or 'none') if rescan else 'none',
+                'symmetry last result': (rescan.last_result or 'not attempted') if rescan else 'disabled',
+                'symmetry backoff': (rescan.describe_backoff() or 'none') if rescan else 'n/a',
             },
             'counters': counters,
             'pending_files': [
@@ -395,6 +401,7 @@ PAGE_HTML = """<!doctype html>
         <option value="scan">Scan</option>
         <option value="discord">Discord</option>
         <option value="cn4m">cn4m</option>
+        <option value="symmetry">symmetry</option>
         <option value="service">Service</option>
       </select>
       <select id="f-lvl">
@@ -419,6 +426,8 @@ const TILES = [
   ['discord_failed', 'Discord failed', 'err'],
   ['status_sent', 'cn4m sent', 'ok'],
   ['status_failed', 'cn4m failed', 'err'],
+  ['rescan_sent', 'symmetry sent', 'ok'],
+  ['rescan_failed', 'symmetry failed', 'err'],
   ['errors', 'Errors', 'err'],
 ];
 

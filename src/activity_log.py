@@ -36,6 +36,8 @@ class ActivityLog:
             'discord_failed': 0,
             'status_sent': 0,
             'status_failed': 0,
+            'rescan_sent': 0,
+            'rescan_failed': 0,
             'errors': 0,
         }
         self._next_id = 1
@@ -199,6 +201,8 @@ def _category_for(logger_name: str) -> str:
         return 'discord'
     if 'status' in logger_name:
         return 'cn4m'
+    if 'rescan' in logger_name:
+        return 'symmetry'
     if 'watcher' in logger_name or 'state' in logger_name:
         return 'scan'
     return 'service'

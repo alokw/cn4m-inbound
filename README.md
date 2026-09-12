@@ -12,6 +12,7 @@ Lightweight Docker service that watches a folder and pings your Discord channel 
 - 📊 **Rich metadata** - Tracks file size, MIME type, modification time, and folder structure
 - 📟 **Status page** - Settings, live status, and an activity log on port 2645
 - 📡 **cn4m updates** - One-line status pushes to the parent system when a scan finds something
+- 🔗 **symmetry triggers** - Tells symmetry the moment a file is complete, so it links it now rather than on its next scan
 - 🐳 **Docker ready** - Simple deployment with Docker Compose
 - ⚙️ **Configurable** - All settings via environment variables
 
@@ -100,8 +101,10 @@ docker-compose logs -f
 | `WEB_UI_ENABLED` | Serve the status page | `true` |
 | `WEB_UI_PORT` | Port for the status page | `2645` |
 | `WEB_UI_HOST` | Interface the status page binds | `0.0.0.0` |
-| `STATUS_URL` | cn4m status endpoint (empty disables updates) | `http://localhost:2640/suite/status` |
+| `STATUS_URL` | cn4m status endpoint (empty disables updates) | `http://host.docker.internal:2640/suite/status` in Docker, `localhost` otherwise |
 | `STATUS_APP_NAME` | Name this service reports itself as to cn4m | `inbound` |
+| `SYMMETRY_RESCAN_URL` | symmetry rescan endpoint (empty disables triggers) | `http://host.docker.internal:2647/api/rescan` in Docker, `localhost` otherwise |
+| `SYMMETRY_RESCAN_TOKEN` | symmetry's `WEBHOOK_TOKEN`, if it has one | none |
 
 ### Exclude Patterns
 
@@ -318,21 +321,26 @@ while it grows. If known files also changed or disappeared, the message says so:
 
 ### localhost means the container
 
-`STATUS_URL` defaults to `http://localhost:2640/suite/status`, which is right
-when inbound runs directly on the same machine as cn4m. **Inside Docker,
-`localhost` is the container itself**, not the machine running Docker, so that
-default cannot reach a cn4m on the host. Use whichever applies:
+**Inside Docker, `localhost` is the container itself**, not the machine running
+Docker, so `http://localhost:2640/...` from a containerised inbound reaches
+nothing. Left unset, `STATUS_URL` (and `SYMMETRY_RESCAN_URL` below) picks the
+host that works for wherever it finds itself running: `host.docker.internal`
+inside a container, `localhost` outside one. Set it explicitly when neither
+fits:
 
-| Where cn4m runs | `STATUS_URL` |
+| Where the other tool runs | Host to use |
 | --- | --- |
-| On the Docker host | `http://host.docker.internal:2640/suite/status` |
-| As another container | `http://<its service name>:2640/suite/status` |
-| Same machine, no Docker | `http://localhost:2640/suite/status` |
+| On the Docker host, or in its own container with a published port | `host.docker.internal` |
+| As a container on a network shared with inbound | `<its service name>` |
+| Same machine, no Docker | `localhost` |
 
-`docker-compose.yml` maps `host.docker.internal` to the host gateway, so the
-first form works on Linux as well as Docker Desktop. If a localhost URL fails
-from inside a container, the log says all this rather than just reporting a
-refused connection.
+Two containers from *separate* `docker-compose.yml` files are on separate
+networks by default and cannot see each other's service names — which is why
+the middle row rarely applies in this suite, and `host.docker.internal` against
+the published port is the one that works. `docker-compose.yml` maps that name
+to the host gateway, so it works on Linux as well as Docker Desktop. If a URL
+fails for a networking reason the log says which one, rather than just
+reporting a refused connection.
 
 ### When cn4m is not there
 
@@ -351,6 +359,40 @@ shutdown, which is what makes the update from the last scan before
 
 The current backoff state and the last message sent are both shown on the status
 page, so you can tell at a glance whether cn4m is hearing from this service.
+
+## Telling symmetry a file is complete
+
+symmetry mirrors the same folder this service watches, creating links for the
+repository. On its own it waits for each file to settle before linking it. This
+service already knows the moment a file has settled, so with
+`SYMMETRY_RESCAN_URL` set it vouches for the file and symmetry links it on
+sight instead of waiting out its own settle period:
+
+```
+POST http://<symmetry-host>:2647/api/rescan
+path=1100/new_asset.mov&path=1100/other_asset.mov
+```
+
+One request per scan carries every file that went stable in it, so ten files
+landing together cost one round trip, not ten. Paths are relative to the watch
+folder with forward slashes — that is what symmetry keys on (relative to its
+`SOURCE_DIR`, as POSIX), so **the two tools must be rooted at the same folder**:
+inbound's `WATCH_FOLDER` and symmetry's `SOURCE_DIR` have to be the same tree,
+even though one is a host path and the other a container path.
+
+Files that were already known and changed are vouched for too, not just new
+ones — a replaced file is a file symmetry needs to relink.
+
+If symmetry has `WEBHOOK_TOKEN` set, put the same value in
+`SYMMETRY_RESCAN_TOKEN`; it travels as an `X-Webhook-Token` header. A wrong
+token gets a `401`, which backs off like any other failure and is shown as the
+last result on the status page.
+
+Everything said above about cn4m being absent applies here unchanged: symmetry
+does not have to be running. A missing symmetry costs one attempt and a log
+line, then backs off from 60 seconds up to 30 minutes, and never delays a scan.
+The trigger goes out *before* the Discord notification, so a slow Discord
+cannot hold it up. Setting `SYMMETRY_RESCAN_URL` empty disables it.
 
 ## Docker Volume Mapping
 
@@ -462,6 +504,19 @@ docker-compose restart
 4. After a failure updates pause and the gap doubles, so a fix may take up to
    30 minutes to be retried — restart the container to retry immediately
 
+### symmetry is not linking files any faster
+
+1. Look at **symmetry last request** and **symmetry last result** on the status
+   page — `ok` means symmetry accepted the request
+2. `401` means symmetry has a `WEBHOOK_TOKEN` and `SYMMETRY_RESCAN_TOKEN` does
+   not match it
+3. If the request is accepted but the file still waits, the path does not match
+   what symmetry sees: check that `WATCH_FOLDER` here and `SOURCE_DIR` there are
+   the same tree. symmetry logs `rescan requested (N paths vouched for)` on its
+   side when a request arrives
+4. Same networking rules as cn4m: from inside Docker, `localhost` is the
+   container; see [localhost means the container](#localhost-means-the-container)
+
 ### Files not being detected
 
 1. Check volume mappings are correct
@@ -503,6 +558,7 @@ export LOG_FILE=./data/watcher.log
 export DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/your_webhook_id/your_webhook_token
 export CHECK_INTERVAL=30s
 export STATUS_URL=http://localhost:2640/suite/status
+export SYMMETRY_RESCAN_URL=http://localhost:2647/api/rescan
 
 # Run
 python -m src.main
